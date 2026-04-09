@@ -64,15 +64,15 @@
       "features": [
         {
           "name": "amf",
-          "platform": "((windows | linux) & static)"
+          "platform": "((x86 | x64) & (windows | linux) & static)"
         },
         {
           "name": "nvcodec",
-          "platform": "((windows | linux) & static)"
+          "platform": "((x86 | x64) & (windows | linux) & static)"
         },
         {
           "name": "qsv",
-          "platform": "(windows & static)"
+          "platform": "((x86 | x64) & windows & static)"
         }
       ],
       "platform": "((windows | (linux & !arm32) | osx) & static)"
