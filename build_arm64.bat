@@ -5,14 +5,17 @@ if errorlevel 1 (
     exit /b 1
 )
 
-set PATH=C:\Users\i-i\.cargo\bin;C:\Users\i-i\.rustup\toolchains\stable-aarch64-pc-windows-msvc\bin;C:\Program Files\LLVM\bin;%PATH%
+rem Adjust REPO_DIR if you cloned to a different location
+set REPO_DIR=C:\local\prj\RustDesk_arm64\repo
 
-cd /d C:\local\prj\RustDesk_arm64\repo
+set PATH=%USERPROFILE%\.cargo\bin;%USERPROFILE%\.rustup\toolchains\stable-aarch64-pc-windows-msvc\bin;C:\Program Files\LLVM\bin;%PATH%
+
+cd /d %REPO_DIR%
 
 set VCPKG_ROOT=C:\local\deploy\vcpkg
-set VCPKG_INSTALLED_ROOT=C:\local\prj\RustDesk_arm64\repo\vcpkg_installed
+set VCPKG_INSTALLED_ROOT=%REPO_DIR%\vcpkg_installed
 set VCPKGRS_TRIPLET=arm64-windows-static
-set SODIUM_LIB_DIR=C:\local\prj\RustDesk_arm64\repo\vcpkg_installed\arm64-windows-static\lib
+set SODIUM_LIB_DIR=%REPO_DIR%\vcpkg_installed\arm64-windows-static\lib
 set BINDGEN_EXTRA_CLANG_ARGS=
 
 cargo build --release --target aarch64-pc-windows-msvc

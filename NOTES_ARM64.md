@@ -3,6 +3,11 @@
 > **Last updated:** 2026-04-10  
 > **Hardware:** Snapdragon X Elite / Windows 11 ARM64  
 > **Status:** Rust backend ✅ complete · Flutter frontend ❌ blocked (Flutter toolchain limitation)
+>
+> **Local paths used in this build:**  
+> - Repo root: `C:\local\prj\RustDesk_arm64\repo\` (adjust to wherever you cloned the fork)  
+> - vcpkg: `C:\local\deploy\vcpkg` (adjust if installed elsewhere)  
+> - Paths containing `%USERPROFILE%` below refer to the user profile — substitute your own.
 
 ---
 
@@ -73,7 +78,7 @@ vcpkg packages are pre-built in `vcpkg_installed\arm64-windows-static\` — no n
 Reproducible one-shot build script for the Rust backend:
 ```bat
 call "...vcvarsall.bat" arm64
-set PATH=C:\Users\i-i\.cargo\bin;C:\Users\i-i\.rustup\toolchains\stable-aarch64-pc-windows-msvc\bin;C:\Program Files\LLVM\bin;%PATH%
+set PATH=%USERPROFILE%\.cargo\bin;%USERPROFILE%\.rustup\toolchains\stable-aarch64-pc-windows-msvc\bin;C:\Program Files\LLVM\bin;%PATH%
 set VCPKG_ROOT=C:\local\deploy\vcpkg
 set VCPKG_INSTALLED_ROOT=C:\local\prj\RustDesk_arm64\repo\vcpkg_installed
 set VCPKGRS_TRIPLET=arm64-windows-static
@@ -109,7 +114,7 @@ flutter_rust_bridge_codegen \
 The `magnum-opus` crate's `build.rs` hardcodes `x86_64-windows-static` as the vcpkg triplet. This file is in cargo's git cache, not in this repo:
 
 ```
-C:\Users\i-i\.cargo\git\checkouts\magnum-opus-<hash>\<rev>\build.rs
+%USERPROFILE%\.cargo\git\checkouts\magnum-opus-<hash>\<rev>\build.rs
 ```
 
 **Re-apply this fix when resuming:**
