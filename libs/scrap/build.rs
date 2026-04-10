@@ -137,6 +137,83 @@ fn find_package(name: &str) -> Vec<PathBuf> {
     }
 }
 
+/// On Windows ARM64, clang (used by bindgen) needs explicit MSVC system include
+/// paths because it cannot auto-discover them the way MSVC cl.exe does. Without
+/// these headers, structs that depend on system typedefs (e.g. `unsigned int`)
+/// come out opaque — only containing a synthetic `_address` field.
+#[cfg(target_os = "windows")]
+fn get_msvc_include_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    // 1. Honor the INCLUDE env var if it was set by VsDevShell / vcvarsall.
+    if let Ok(include_env) = std::env::var("INCLUDE") {
+        for p in include_env.split(';') {
+            let p = p.trim();
+            if !p.is_empty() {
+                paths.push(PathBuf::from(p));
+            }
+        }
+        if !paths.is_empty() {
+            return paths;
+        }
+    }
+
+    // 2. Auto-discover via vswhere (always present with VS 2017+).
+    let vswhere =
+        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe";
+    if std::path::Path::new(vswhere).exists() {
+        if let Ok(output) = std::process::Command::new(vswhere)
+            .args(["-latest", "-property", "installationPath"])
+            .output()
+        {
+            let vs_path = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_string();
+            if !vs_path.is_empty() {
+                let tools_dir =
+                    PathBuf::from(&vs_path).join(r"VC\Tools\MSVC");
+                if let Ok(entries) = std::fs::read_dir(&tools_dir) {
+                    let mut versions: Vec<_> =
+                        entries.filter_map(|e| e.ok()).collect();
+                    // Sort descending — pick latest toolset.
+                    versions
+                        .sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+                    if let Some(latest) = versions.first() {
+                        paths.push(latest.path().join("include"));
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Auto-discover Windows SDK (ucrt / um / shared sub-dirs needed).
+    let sdk_base =
+        PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\Include");
+    if sdk_base.exists() {
+        if let Ok(entries) = std::fs::read_dir(&sdk_base) {
+            let mut versions: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .collect();
+            // Sort descending — pick latest SDK.
+            versions.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+            if let Some(latest) = versions.first() {
+                let sdk_ver = latest.path();
+                for subdir in &["ucrt", "um", "shared"] {
+                    paths.push(sdk_ver.join(subdir));
+                }
+            }
+        }
+    }
+
+    paths
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_msvc_include_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
 fn generate_bindings(
     ffi_header: &Path,
     include_paths: &[PathBuf],
@@ -144,6 +221,9 @@ fn generate_bindings(
     exact_file: &Path,
     regex: &str,
 ) {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+
     let mut b = bindgen::builder()
         .header(ffi_header.to_str().unwrap())
         .allowlist_type(regex)
@@ -158,8 +238,265 @@ fn generate_bindings(
         b = b.clang_arg(format!("-I{}", dir.display()));
     }
 
+    // On Windows ARM64 clang needs the explicit triple + MSVC system headers.
+    if target_os == "windows" && target_arch == "aarch64" {
+        b = b.clang_arg("--target=aarch64-pc-windows-msvc");
+        let msvc_paths = get_msvc_include_paths();
+        for path in &msvc_paths {
+            b = b.clang_arg(format!("-I{}", path.display()));
+        }
+    }
+
     b.generate().unwrap().write_to_file(ffi_rs).unwrap();
     fs::copy(ffi_rs, exact_file).ok(); // ignore failure
+}
+
+/// On Windows ARM64, bindgen 0.65 generates opaque structs for types that are
+/// forward-declared (via `const struct Foo *` in a shared codec header) before
+/// their full definition appears in a separate encoder/decoder header.  Clang
+/// parses them correctly, but bindgen's cursor traversal picks up the first
+/// (incomplete) cursor and emits `{ _address: u8 }`.
+///
+/// This function detects and replaces those four specific opaque structs with
+/// hand-written definitions that exactly match the C layout.
+fn patch_opaque_cfg_structs(path: &Path) {
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+    let raw = match fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    // Normalise to LF so our patterns always match regardless of platform.
+    let content = String::from_utf8_lossy(&raw)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+
+    let patched = if filename.contains("vpx_ffi") {
+        patch_vpx_cfg_structs(content)
+    } else if filename.contains("aom_ffi") {
+        patch_aom_cfg_structs(content)
+    } else {
+        return;
+    };
+
+    println!("cargo:warning=patch_opaque_cfg_structs: applied to {}", path.display());
+    if let Err(e) = fs::write(path, patched.as_bytes()) {
+        println!("cargo:warning=patch_opaque_cfg_structs write failed: {e}");
+    }
+}
+
+fn patch_vpx_cfg_structs(mut src: String) -> String {
+    // vpx_codec_enc_cfg — generated as opaque; replace with full layout.
+    let opaque_enc = "#[repr(C)]\n#[derive(Debug, Copy, Clone)]\npub struct vpx_codec_enc_cfg {\n    pub _address: u8,\n}";
+    let correct_enc = "\
+#[repr(C)]\n\
+#[derive(Debug, Copy, Clone)]\n\
+pub struct vpx_codec_enc_cfg {\n\
+    pub g_usage: ::std::os::raw::c_uint,\n\
+    pub g_threads: ::std::os::raw::c_uint,\n\
+    pub g_profile: ::std::os::raw::c_uint,\n\
+    pub g_w: ::std::os::raw::c_uint,\n\
+    pub g_h: ::std::os::raw::c_uint,\n\
+    pub g_bit_depth: vpx_bit_depth_t,\n\
+    pub g_input_bit_depth: ::std::os::raw::c_uint,\n\
+    pub g_timebase: vpx_rational,\n\
+    pub g_error_resilient: vpx_codec_er_flags_t,\n\
+    pub g_pass: vpx_enc_pass,\n\
+    pub g_lag_in_frames: ::std::os::raw::c_uint,\n\
+    pub rc_dropframe_thresh: ::std::os::raw::c_uint,\n\
+    pub rc_resize_allowed: ::std::os::raw::c_uint,\n\
+    pub rc_scaled_width: ::std::os::raw::c_uint,\n\
+    pub rc_scaled_height: ::std::os::raw::c_uint,\n\
+    pub rc_resize_up_thresh: ::std::os::raw::c_uint,\n\
+    pub rc_resize_down_thresh: ::std::os::raw::c_uint,\n\
+    pub rc_end_usage: vpx_rc_mode,\n\
+    pub rc_twopass_stats_in: vpx_fixed_buf,\n\
+    pub rc_firstpass_mb_stats_in: vpx_fixed_buf,\n\
+    pub rc_target_bitrate: ::std::os::raw::c_uint,\n\
+    pub rc_min_quantizer: ::std::os::raw::c_uint,\n\
+    pub rc_max_quantizer: ::std::os::raw::c_uint,\n\
+    pub rc_undershoot_pct: ::std::os::raw::c_uint,\n\
+    pub rc_overshoot_pct: ::std::os::raw::c_uint,\n\
+    pub rc_buf_sz: ::std::os::raw::c_uint,\n\
+    pub rc_buf_initial_sz: ::std::os::raw::c_uint,\n\
+    pub rc_buf_optimal_sz: ::std::os::raw::c_uint,\n\
+    pub rc_2pass_vbr_bias_pct: ::std::os::raw::c_uint,\n\
+    pub rc_2pass_vbr_minsection_pct: ::std::os::raw::c_uint,\n\
+    pub rc_2pass_vbr_maxsection_pct: ::std::os::raw::c_uint,\n\
+    pub rc_2pass_vbr_corpus_complexity: ::std::os::raw::c_uint,\n\
+    pub kf_mode: vpx_kf_mode,\n\
+    pub kf_min_dist: ::std::os::raw::c_uint,\n\
+    pub kf_max_dist: ::std::os::raw::c_uint,\n\
+    pub ss_number_layers: ::std::os::raw::c_uint,\n\
+    pub ss_enable_auto_alt_ref: [::std::os::raw::c_int; 5usize],\n\
+    pub ss_target_bitrate: [::std::os::raw::c_uint; 5usize],\n\
+    pub ts_number_layers: ::std::os::raw::c_uint,\n\
+    pub ts_target_bitrate: [::std::os::raw::c_uint; 5usize],\n\
+    pub ts_rate_decimator: [::std::os::raw::c_uint; 5usize],\n\
+    pub ts_periodicity: ::std::os::raw::c_uint,\n\
+    pub ts_layer_id: [::std::os::raw::c_uint; 16usize],\n\
+    pub layer_target_bitrate: [::std::os::raw::c_uint; 12usize],\n\
+    pub temporal_layering_mode: ::std::os::raw::c_int,\n\
+    pub use_vizier_rc_params: ::std::os::raw::c_int,\n\
+    pub active_wq_factor: vpx_rational,\n\
+    pub err_per_mb_factor: vpx_rational,\n\
+    pub sr_default_decay_limit: vpx_rational,\n\
+    pub sr_diff_factor: vpx_rational,\n\
+    pub kf_err_per_mb_factor: vpx_rational,\n\
+    pub kf_frame_min_boost_factor: vpx_rational,\n\
+    pub kf_frame_max_boost_first_factor: vpx_rational,\n\
+    pub kf_frame_max_boost_subs_factor: vpx_rational,\n\
+    pub kf_max_total_boost_factor: vpx_rational,\n\
+    pub gf_max_total_boost_factor: vpx_rational,\n\
+    pub gf_frame_max_boost_factor: vpx_rational,\n\
+    pub zm_factor: vpx_rational,\n\
+    pub rd_mult_inter_qp_fac: vpx_rational,\n\
+    pub rd_mult_arf_qp_fac: vpx_rational,\n\
+    pub rd_mult_key_qp_fac: vpx_rational,\n\
+}";
+    if !src.contains(opaque_enc) {
+        println!("cargo:warning=vpx enc_cfg opaque pattern not found; check bindgen output format");
+    }
+    src = src.replace(opaque_enc, correct_enc);
+
+    // vpx_codec_dec_cfg — three unsigned int fields.
+    let opaque_dec = "#[repr(C)]\n#[derive(Debug, Copy, Clone)]\npub struct vpx_codec_dec_cfg {\n    pub _address: u8,\n}";
+    let correct_dec = "\
+#[repr(C)]\n\
+#[derive(Debug, Copy, Clone)]\n\
+pub struct vpx_codec_dec_cfg {\n\
+    pub threads: ::std::os::raw::c_uint,\n\
+    pub w: ::std::os::raw::c_uint,\n\
+    pub h: ::std::os::raw::c_uint,\n\
+}";
+    src.replace(opaque_dec, correct_dec)
+}
+
+fn patch_aom_cfg_structs(mut src: String) -> String {
+    // cfg_options_t is not matched by the allowlist regex; inject it before
+    // aom_codec_enc_cfg so the field reference compiles.
+    let cfg_options_def = "\
+#[repr(C)]\n\
+#[derive(Debug, Copy, Clone)]\n\
+pub struct cfg_options_t {\n\
+    pub init_by_cfg_file: ::std::os::raw::c_uint,\n\
+    pub super_block_size: ::std::os::raw::c_uint,\n\
+    pub max_partition_size: ::std::os::raw::c_uint,\n\
+    pub min_partition_size: ::std::os::raw::c_uint,\n\
+    pub disable_ab_partition_type: ::std::os::raw::c_uint,\n\
+    pub disable_rect_partition_type: ::std::os::raw::c_uint,\n\
+    pub disable_1to4_partition_type: ::std::os::raw::c_uint,\n\
+    pub disable_flip_idtx: ::std::os::raw::c_uint,\n\
+    pub disable_cdef: ::std::os::raw::c_uint,\n\
+    pub disable_lr: ::std::os::raw::c_uint,\n\
+    pub disable_obmc: ::std::os::raw::c_uint,\n\
+    pub disable_warp_motion: ::std::os::raw::c_uint,\n\
+    pub disable_global_motion: ::std::os::raw::c_uint,\n\
+    pub disable_dist_wtd_comp: ::std::os::raw::c_uint,\n\
+    pub disable_diff_wtd_comp: ::std::os::raw::c_uint,\n\
+    pub disable_inter_intra_comp: ::std::os::raw::c_uint,\n\
+    pub disable_masked_comp: ::std::os::raw::c_uint,\n\
+    pub disable_one_sided_comp: ::std::os::raw::c_uint,\n\
+    pub disable_palette: ::std::os::raw::c_uint,\n\
+    pub disable_intrabc: ::std::os::raw::c_uint,\n\
+    pub disable_cfl: ::std::os::raw::c_uint,\n\
+    pub disable_smooth_intra: ::std::os::raw::c_uint,\n\
+    pub disable_filter_intra: ::std::os::raw::c_uint,\n\
+    pub disable_dual_filter: ::std::os::raw::c_uint,\n\
+    pub disable_intra_angle_delta: ::std::os::raw::c_uint,\n\
+    pub disable_intra_edge_filter: ::std::os::raw::c_uint,\n\
+    pub disable_tx_64x64: ::std::os::raw::c_uint,\n\
+    pub disable_smooth_inter_intra: ::std::os::raw::c_uint,\n\
+    pub disable_inter_inter_wedge: ::std::os::raw::c_uint,\n\
+    pub disable_inter_intra_wedge: ::std::os::raw::c_uint,\n\
+    pub disable_paeth_intra: ::std::os::raw::c_uint,\n\
+    pub disable_trellis_quant: ::std::os::raw::c_uint,\n\
+    pub disable_ref_frame_mv: ::std::os::raw::c_uint,\n\
+    pub reduced_reference_set: ::std::os::raw::c_uint,\n\
+    pub reduced_tx_type_set: ::std::os::raw::c_uint,\n\
+}\n\n";
+
+    // aom_codec_enc_cfg — generated as opaque; replace with full layout.
+    let opaque_enc = "\
+#[repr(C)]\n\
+#[derive(Debug, Copy, Clone)]\n\
+pub struct aom_codec_enc_cfg {\n    pub _address: u8,\n}";
+    let correct_enc = format!("\
+{cfg_options_def}\
+#[repr(C)]\n\
+#[derive(Debug, Copy, Clone)]\n\
+pub struct aom_codec_enc_cfg {{\n\
+    pub g_usage: ::std::os::raw::c_uint,\n\
+    pub g_threads: ::std::os::raw::c_uint,\n\
+    pub g_profile: ::std::os::raw::c_uint,\n\
+    pub g_w: ::std::os::raw::c_uint,\n\
+    pub g_h: ::std::os::raw::c_uint,\n\
+    pub g_limit: ::std::os::raw::c_uint,\n\
+    pub g_forced_max_frame_width: ::std::os::raw::c_uint,\n\
+    pub g_forced_max_frame_height: ::std::os::raw::c_uint,\n\
+    pub g_bit_depth: aom_bit_depth_t,\n\
+    pub g_input_bit_depth: ::std::os::raw::c_uint,\n\
+    pub g_timebase: aom_rational,\n\
+    pub g_error_resilient: aom_codec_er_flags_t,\n\
+    pub g_pass: aom_enc_pass,\n\
+    pub g_lag_in_frames: ::std::os::raw::c_uint,\n\
+    pub rc_dropframe_thresh: ::std::os::raw::c_uint,\n\
+    pub rc_resize_mode: ::std::os::raw::c_uint,\n\
+    pub rc_resize_denominator: ::std::os::raw::c_uint,\n\
+    pub rc_resize_kf_denominator: ::std::os::raw::c_uint,\n\
+    pub rc_superres_mode: aom_superres_mode,\n\
+    pub rc_superres_denominator: ::std::os::raw::c_uint,\n\
+    pub rc_superres_kf_denominator: ::std::os::raw::c_uint,\n\
+    pub rc_superres_qthresh: ::std::os::raw::c_uint,\n\
+    pub rc_superres_kf_qthresh: ::std::os::raw::c_uint,\n\
+    pub rc_end_usage: aom_rc_mode,\n\
+    pub rc_twopass_stats_in: aom_fixed_buf,\n\
+    pub rc_firstpass_mb_stats_in: aom_fixed_buf,\n\
+    pub rc_target_bitrate: ::std::os::raw::c_uint,\n\
+    pub rc_min_quantizer: ::std::os::raw::c_uint,\n\
+    pub rc_max_quantizer: ::std::os::raw::c_uint,\n\
+    pub rc_undershoot_pct: ::std::os::raw::c_uint,\n\
+    pub rc_overshoot_pct: ::std::os::raw::c_uint,\n\
+    pub rc_buf_sz: ::std::os::raw::c_uint,\n\
+    pub rc_buf_initial_sz: ::std::os::raw::c_uint,\n\
+    pub rc_buf_optimal_sz: ::std::os::raw::c_uint,\n\
+    pub rc_2pass_vbr_bias_pct: ::std::os::raw::c_uint,\n\
+    pub rc_2pass_vbr_minsection_pct: ::std::os::raw::c_uint,\n\
+    pub rc_2pass_vbr_maxsection_pct: ::std::os::raw::c_uint,\n\
+    pub fwd_kf_enabled: ::std::os::raw::c_int,\n\
+    pub kf_mode: aom_kf_mode,\n\
+    pub kf_min_dist: ::std::os::raw::c_uint,\n\
+    pub kf_max_dist: ::std::os::raw::c_uint,\n\
+    pub sframe_dist: ::std::os::raw::c_uint,\n\
+    pub sframe_mode: ::std::os::raw::c_uint,\n\
+    pub large_scale_tile: ::std::os::raw::c_uint,\n\
+    pub monochrome: ::std::os::raw::c_uint,\n\
+    pub full_still_picture_hdr: ::std::os::raw::c_uint,\n\
+    pub save_as_annexb: ::std::os::raw::c_uint,\n\
+    pub tile_width_count: ::std::os::raw::c_int,\n\
+    pub tile_height_count: ::std::os::raw::c_int,\n\
+    pub tile_widths: [::std::os::raw::c_int; 64usize],\n\
+    pub tile_heights: [::std::os::raw::c_int; 64usize],\n\
+    pub use_fixed_qp_offsets: ::std::os::raw::c_uint,\n\
+    pub fixed_qp_offsets: [::std::os::raw::c_int; 5usize],\n\
+    pub encoder_cfg: cfg_options_t,\n\
+}}");
+    src = src.replace(opaque_enc, &correct_enc);
+
+    // aom_codec_dec_cfg — four unsigned int fields.
+    let opaque_dec = "\
+#[repr(C)]\n\
+#[derive(Debug, Copy, Clone)]\n\
+pub struct aom_codec_dec_cfg {\n    pub _address: u8,\n}";
+    let correct_dec = "\
+#[repr(C)]\n\
+#[derive(Debug, Copy, Clone)]\n\
+pub struct aom_codec_dec_cfg {\n\
+    pub threads: ::std::os::raw::c_uint,\n\
+    pub w: ::std::os::raw::c_uint,\n\
+    pub h: ::std::os::raw::c_uint,\n\
+    pub allow_lowbitdepth: ::std::os::raw::c_uint,\n\
+}";
+    src.replace(opaque_dec, correct_dec)
 }
 
 fn gen_vcpkg_package(package: &str, ffi_header: &str, generated: &str, regex: &str) {
@@ -178,6 +515,13 @@ fn gen_vcpkg_package(package: &str, ffi_header: &str, generated: &str, regex: &s
     let ffi_rs = out_dir.join(generated);
     let exact_file = src_dir.join("generated").join(generated);
     generate_bindings(&ffi_header, &includes, &ffi_rs, &exact_file, regex);
+
+    // Fix opaque cfg structs that bindgen can't resolve on Windows ARM64.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if target_os == "windows" && target_arch == "aarch64" {
+        patch_opaque_cfg_structs(&ffi_rs);
+    }
 }
 
 // If you have problems installing ffmpeg, you can download $VCPKG_ROOT/installed from ci
